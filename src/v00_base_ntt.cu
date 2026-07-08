@@ -318,13 +318,6 @@ int main(int argc, char* argv[]) {
     std::cout << "Benchmark iterations: " << BENCHMARK_ITERATIONS << "\n";
     std::cout << "N: " << N << "\n";
     std::cout << "limbs: " << limb_count << "\n";
-    for (size_t limb = 0; limb < limb_count; ++limb) {
-        std::cout << "limb " << limb
-                  << " qi: " << mod_runtime[limb].qi
-                  << ", primitive_root: " << mod_runtime[limb].primitive_root
-                  << ", psi: " << mod_runtime[limb].psi
-                  << ", omega: " << mod_runtime[limb].omega << "\n";
-    }
 
     size_t total_values = limb_count * N;
 
