@@ -58,15 +58,24 @@ Short aliases:
 
 ## Config
 
-Edit the config in `main()`:
+Edit the shared config in `src/ntt_config.h`:
 
 ```cpp
-constexpr int logN = 16;
-constexpr uint32_t qi0 = 998244353u;
-constexpr uint32_t primitive_root0 = 3u;
-const std::vector<ModulusConfig> moduli = {
-    {qi0, primitive_root0},
-};
+inline VersionConfig default_ntt_config() {
+    return {
+        16,
+        {
+            {974258177u, 3u},
+            {1081212929u, 6u},
+            {1196556289u, 7u},
+            {993263617u, 5u},
+            {989986817u, 3u},
+            {1074266113u, 5u},
+            {1168900097u, 5u},
+            {1010565121u, 7u},
+        },
+    };
+}
 ```
 
 Each `qi` must satisfy:
@@ -83,10 +92,7 @@ qi == 1 mod 2N
 To add more limbs, add more entries to `moduli`:
 
 ```cpp
-const std::vector<ModulusConfig> moduli = {
-    {qi0, primitive_root0},
-    {qi1, primitive_root1},
-};
+{qi_next, primitive_root_next},
 ```
 
 Inputs, outputs, twiddles, and CPU verification are then handled per limb.
@@ -107,6 +113,16 @@ Nsight Compute:
   --nvtx --nvtx-include "custom_ntt/" \
   -o ntt_v00_ncu ./v00_base_ntt
 ```
+
+## Results Log
+
+The benchmark time currently includes restoring the device input before each NTT.
+
+| Version | Config | Limbs | Time (ms) | Throughput (GOp/s) | Notes |
+| --- | --- | ---: |  ---: | ---: | --- |
+| v00 | `N=65536`, 8 limbs from `src/ntt_config.h` | 8 |  | Per-stage kernel baseline |
+| v01 |  |  |  |  |
+| v02 |  |  |  |  |
 
 ## Version Notes
 

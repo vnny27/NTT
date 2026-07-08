@@ -14,15 +14,7 @@
 #include <nvToolsExt.h>
 #endif
 
-struct ModulusConfig {
-    uint32_t qi;
-    uint32_t primitive_root;
-};
-
-struct VersionConfig {
-    int logN;
-    std::vector<ModulusConfig> moduli;
-};
+#include "ntt_config.h"
 
 struct ModulusRuntime {
     uint32_t qi;
@@ -292,13 +284,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    constexpr int logN = 16;
-    constexpr uint32_t qi0 = 998244353u;
-    constexpr uint32_t primitive_root0 = 3u;
-    const std::vector<ModulusConfig> moduli = {
-        {qi0, primitive_root0},
-    };
-    VersionConfig ver_config = {logN, moduli};
+    VersionConfig ver_config = default_ntt_config();
+    int logN = ver_config.logN;
     size_t N = size_t{1} << logN;
     size_t limb_count = ver_config.moduli.size();
     if (limb_count == 0) {
