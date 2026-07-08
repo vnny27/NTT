@@ -8,9 +8,23 @@ struct ModulusConfig {
     uint32_t primitive_root;
 };
 
+struct PhaseConfig {
+    int radix_stages;      // log2(radix) handled by this phase
+    int stage_merging;     // radix-2 stages fused in one local step
+    int log_warp_batching; // coalescing/batching factor for phase indexing
+};
+
+struct TransformConfig {
+    PhaseConfig ntt_phase1;
+    PhaseConfig ntt_phase2;
+    PhaseConfig intt_phase1;
+    PhaseConfig intt_phase2;
+};
+
 struct VersionConfig {
     int logN;
     std::vector<ModulusConfig> moduli;
+    TransformConfig transform;
 };
 
 inline VersionConfig default_ntt_config() {
@@ -33,6 +47,12 @@ inline VersionConfig default_ntt_config() {
             {1073479681u, 11u},
             {1158676481u, 3u},
             {1016463361u, 38u},
+        },
+        {
+            {7, 4, 4},
+            {9, 3, 0},
+            {9, 3, 0},
+            {7, 4, 4},
         },
     };
 }

@@ -31,6 +31,8 @@ With NVTX ranges for Nsight:
   src/v00_base_ntt.cu -o v00_base_ntt
 ```
 
+When `USE_NVTX` is enabled, `BENCHMARK_ITERATIONS` is set to `1` to keep profiling traces compact.
+
 Adjust `sm_89` if the target GPU uses a different architecture.
 
 ## Run
@@ -82,6 +84,12 @@ inline VersionConfig default_ntt_config() {
             {1158676481u, 3u},
             {1016463361u, 38u},
         },
+        {
+            {7, 4, 4}, // NTT phase 1
+            {9, 3, 0}, // NTT phase 2
+            {9, 3, 0}, // INTT phase 1
+            {7, 4, 4}, // INTT phase 2
+        },
     };
 }
 ```
@@ -104,6 +112,16 @@ To add more limbs, add more entries to `moduli`:
 ```
 
 Inputs, outputs, twiddles, and CPU verification are then handled per limb.
+
+For each phase config, the fields are:
+
+```cpp
+{radix_stages, stage_merging, log_warp_batching}
+```
+
+- `radix_stages`: `log2(radix)` handled by the phase.
+- `stage_merging`: radix-2 stages fused inside one local register/shared-memory step.
+- `log_warp_batching`: batching factor used by phase indexing to improve coalescing.
 
 ## Profiling
 
