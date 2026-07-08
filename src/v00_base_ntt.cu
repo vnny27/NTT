@@ -20,7 +20,9 @@ struct ModulusRuntime {
     uint32_t qi;
     uint32_t primitive_root;
     uint32_t psi;   // primitive 2N-th root
+    uint32_t psi_inv;
     uint32_t omega; // psi^2, primitive N-th root
+    uint32_t degree_inv;
 };
 
 #define SEED 1234
@@ -56,6 +58,18 @@ __device__ inline void butterfly(uint32_t* A_limb, const uint32_t* tw_limb,
     A_limb[a + t] = sub_mod(u, v, q);
 }
 
+__device__ inline void inverse_butterfly(uint32_t* A_limb,
+                                         const uint32_t* tw_limb,
+                                         size_t t, size_t stage_block,
+                                         size_t stage_id, size_t m,
+                                         uint32_t q) {
+    size_t a = stage_block * 2 * t + stage_id;
+    uint32_t u = A_limb[a];
+    uint32_t v = A_limb[a + t];
+    A_limb[a] = add_mod(u, v, q);
+    A_limb[a + t] = mul_mod(sub_mod(u, v, q), tw_limb[m + stage_block], q);
+}
+
 __global__ void NTTStage(uint32_t* A, const uint32_t* twiddles,
                          const uint32_t* moduli, size_t N,
                          size_t m, size_t t) {
@@ -74,6 +88,36 @@ __global__ void NTTStage(uint32_t* A, const uint32_t* twiddles,
     butterfly(A_limb, tw_limb, t, stage_block, stage_id, m, q);
 }
 
+__global__ void INTTStage(uint32_t* A, const uint32_t* inv_twiddles,
+                          const uint32_t* moduli, size_t N,
+                          size_t m, size_t t) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= (N >> 1)) {
+        return;
+    }
+
+    size_t limb = blockIdx.y;
+    uint32_t q = moduli[limb];
+    uint32_t* A_limb = A + limb * N;
+    const uint32_t* tw_limb = inv_twiddles + limb * N;
+
+    size_t stage_block = tid / t;
+    size_t stage_id = tid % t;
+    inverse_butterfly(A_limb, tw_limb, t, stage_block, stage_id, m, q);
+}
+
+__global__ void NormalizeKernel(uint32_t* A, const uint32_t* moduli,
+                                const uint32_t* degree_inv, size_t N) {
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= N) {
+        return;
+    }
+
+    size_t limb = blockIdx.y;
+    uint32_t q = moduli[limb];
+    A[limb * N + tid] = mul_mod(A[limb * N + tid], degree_inv[limb], q);
+}
+
 void launch_ntt(uint32_t* A_dev, const uint32_t* twiddle_dev,
                 const uint32_t* moduli_dev, size_t N, int logN,
                 size_t limb_count, dim3 dimBlock) {
@@ -88,6 +132,29 @@ void launch_ntt(uint32_t* A_dev, const uint32_t* twiddle_dev,
         NTTStage<<<dimGrid, dimBlock>>>(A_dev, twiddle_dev, moduli_dev, N, m, t);
         t >>= 1;
     }
+}
+
+void launch_intt(uint32_t* A_dev, const uint32_t* inv_twiddle_dev,
+                 const uint32_t* moduli_dev, const uint32_t* degree_inv_dev,
+                 size_t N, int logN, size_t limb_count, dim3 dimBlock) {
+    size_t butterflies = N >> 1;
+    unsigned int grid_x =
+        static_cast<unsigned int>((butterflies + dimBlock.x - 1) / dimBlock.x);
+    dim3 dimGrid(grid_x, static_cast<unsigned int>(limb_count), 1);
+
+    size_t t = 1;
+    for (int stage = logN - 1; stage >= 0; --stage) {
+        size_t m = size_t{1} << stage;
+        INTTStage<<<dimGrid, dimBlock>>>(
+            A_dev, inv_twiddle_dev, moduli_dev, N, m, t);
+        t <<= 1;
+    }
+
+    unsigned int normalize_grid_x =
+        static_cast<unsigned int>((N + dimBlock.x - 1) / dimBlock.x);
+    dim3 normalizeGrid(normalize_grid_x, static_cast<unsigned int>(limb_count), 1);
+    NormalizeKernel<<<normalizeGrid, dimBlock>>>(
+        A_dev, moduli_dev, degree_inv_dev, N);
 }
 
 uint32_t pow_mod(uint32_t base, uint64_t exp, uint32_t mod) {
@@ -124,8 +191,11 @@ ModulusRuntime make_modulus_runtime(int logN, const ModulusConfig& config) {
         config.primitive_root,
         (static_cast<uint64_t>(config.qi) - 1) / root_order,
         config.qi);
+    uint32_t psi_inv = pow_mod(psi, config.qi - 2, config.qi);
     uint32_t omega = static_cast<uint32_t>(
         (static_cast<uint64_t>(psi) * psi) % config.qi);
+    uint32_t degree_inv = pow_mod(static_cast<uint32_t>(N), config.qi - 2,
+                                  config.qi);
 
     if (pow_mod(psi, root_order, config.qi) != 1 ||
         pow_mod(psi, N, config.qi) != config.qi - 1) {
@@ -133,7 +203,7 @@ ModulusRuntime make_modulus_runtime(int logN, const ModulusConfig& config) {
         std::exit(EXIT_FAILURE);
     }
 
-    return {config.qi, config.primitive_root, psi, omega};
+    return {config.qi, config.primitive_root, psi, psi_inv, omega, degree_inv};
 }
 
 std::vector<uint32_t> make_twiddle_table(int logN, uint32_t q, uint32_t psi) {
@@ -182,6 +252,31 @@ void cpu_ntt_butterfly(uint32_t* a, int logN, uint32_t q, const uint32_t* psi) {
             }
         }
         t >>= 1;
+    }
+}
+
+void cpu_intt_butterfly(uint32_t* a, int logN, uint32_t q,
+                        const uint32_t* inv_psi, uint32_t degree_inv) {
+    size_t N = size_t{1} << logN;
+    size_t t = 1;
+
+    for (size_t m = N >> 1; m >= 1; m >>= 1) {
+        for (size_t j = 0; j < m; j += 1) {
+            for (size_t k = j * 2 * t; k < j * 2 * t + t; k += 1) {
+                uint32_t u = a[k];
+                uint32_t v = a[k + t];
+                a[k] = add_mod(u, v, q);
+                a[k + t] = mul_mod(sub_mod(u, v, q), inv_psi[m + j], q);
+            }
+        }
+        t <<= 1;
+        if (m == 1) {
+            break;
+        }
+    }
+
+    for (size_t i = 0; i < N; ++i) {
+        a[i] = mul_mod(a[i], degree_inv, q);
     }
 }
 
@@ -295,18 +390,25 @@ int main(int argc, char* argv[]) {
 
     std::vector<ModulusRuntime> mod_runtime;
     std::vector<uint32_t> moduli_host(limb_count);
+    std::vector<uint32_t> degree_inv_host(limb_count);
     std::vector<uint32_t> twiddle_table(limb_count * N);
+    std::vector<uint32_t> inv_twiddle_table(limb_count * N);
     mod_runtime.reserve(limb_count);
     for (size_t limb = 0; limb < limb_count; ++limb) {
         ModulusRuntime runtime =
             make_modulus_runtime(logN, ver_config.moduli[limb]);
         mod_runtime.push_back(runtime);
         moduli_host[limb] = runtime.qi;
+        degree_inv_host[limb] = runtime.degree_inv;
 
         std::vector<uint32_t> limb_twiddles =
             make_twiddle_table(logN, runtime.qi, runtime.psi);
+        std::vector<uint32_t> limb_inv_twiddles =
+            make_twiddle_table(logN, runtime.qi, runtime.psi_inv);
         std::copy(limb_twiddles.begin(), limb_twiddles.end(),
                   twiddle_table.begin() + limb * N);
+        std::copy(limb_inv_twiddles.begin(), limb_inv_twiddles.end(),
+                  inv_twiddle_table.begin() + limb * N);
     }
 
     std::cout << std::fixed << std::setprecision(3);
@@ -336,18 +438,28 @@ int main(int argc, char* argv[]) {
     const size_t moduli_bytes = limb_count * sizeof(uint32_t);
     uint32_t* A_input_dev = nullptr;
     uint32_t* A_custom_dev = nullptr;
+    uint32_t* A_ntt_input_dev = nullptr;
     uint32_t* twiddle_dev = nullptr;
+    uint32_t* inv_twiddle_dev = nullptr;
     uint32_t* moduli_dev = nullptr;
+    uint32_t* degree_inv_dev = nullptr;
 
     cudaMalloc((void**)&A_input_dev, bytes);
     cudaMalloc((void**)&A_custom_dev, bytes);
+    cudaMalloc((void**)&A_ntt_input_dev, bytes);
     cudaMalloc((void**)&twiddle_dev, bytes);
+    cudaMalloc((void**)&inv_twiddle_dev, bytes);
     cudaMalloc((void**)&moduli_dev, moduli_bytes);
+    cudaMalloc((void**)&degree_inv_dev, moduli_bytes);
 
     cudaMemcpy(A_input_dev, A_host, bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(A_custom_dev, A_input_dev, bytes, cudaMemcpyDeviceToDevice);
     cudaMemcpy(twiddle_dev, twiddle_table.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(inv_twiddle_dev, inv_twiddle_table.data(), bytes,
+               cudaMemcpyHostToDevice);
     cudaMemcpy(moduli_dev, moduli_host.data(), moduli_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(degree_inv_dev, degree_inv_host.data(), moduli_bytes,
+               cudaMemcpyHostToDevice);
 
     dim3 dimBlock(BLOCK_DIM, 1, 1);
 
@@ -372,39 +484,157 @@ int main(int argc, char* argv[]) {
     }
     cudaEventRecord(stop);
 
-    cudaError_t launchErr = cudaGetLastError();
-    cudaError_t syncErr = cudaEventSynchronize(stop);
+    cudaError_t nttLaunchErr = cudaGetLastError();
+    cudaError_t nttSyncErr = cudaEventSynchronize(stop);
     profiler_range_pop();
 
-    float execution_time = 0.0f;
-    if (launchErr == cudaSuccess && syncErr == cudaSuccess) {
-        cudaEventElapsedTime(&execution_time, start, stop);
-        execution_time /= BENCHMARK_ITERATIONS;
+    float ntt_execution_time = 0.0f;
+    if (nttLaunchErr == cudaSuccess && nttSyncErr == cudaSuccess) {
+        cudaEventElapsedTime(&ntt_execution_time, start, stop);
+        ntt_execution_time /= BENCHMARK_ITERATIONS;
+    }
+
+    if (nttLaunchErr != cudaSuccess) {
+        std::cout << "  [CUDA ERROR]: " << cudaGetErrorString(nttLaunchErr)
+                  << std::endl;
+    } else if (nttSyncErr != cudaSuccess) {
+        std::cout << "  [CUDA ERROR]: " << cudaGetErrorString(nttSyncErr)
+                  << std::endl;
+    } else {
+        print_time_result("Custom NTT kernel", ntt_execution_time, ver_config);
+    }
+
+    cudaMemcpy(A_ntt_input_dev, A_input_dev, bytes, cudaMemcpyDeviceToDevice);
+    launch_ntt(A_ntt_input_dev, twiddle_dev, moduli_dev, N, logN,
+               limb_count, dimBlock);
+    cudaError_t prepLaunchErr = cudaGetLastError();
+    cudaError_t prepSyncErr = cudaDeviceSynchronize();
+
+    cudaError_t inttLaunchErr = prepLaunchErr;
+    cudaError_t inttSyncErr = prepSyncErr;
+    float intt_execution_time = 0.0f;
+    if (prepLaunchErr == cudaSuccess && prepSyncErr == cudaSuccess) {
+        for (int i = 0; i < WARMUP_ITERATIONS; ++i) {
+            cudaMemcpy(A_custom_dev, A_ntt_input_dev, bytes,
+                       cudaMemcpyDeviceToDevice);
+            launch_intt(A_custom_dev, inv_twiddle_dev, moduli_dev,
+                        degree_inv_dev, N, logN, limb_count, dimBlock);
+        }
+        cudaDeviceSynchronize();
+
+        //copy time included
+        profiler_range_push("custom_intt");
+        cudaEventRecord(start);
+        for (int i = 0; i < BENCHMARK_ITERATIONS; ++i) {
+            cudaMemcpy(A_custom_dev, A_ntt_input_dev, bytes,
+                       cudaMemcpyDeviceToDevice);
+            launch_intt(A_custom_dev, inv_twiddle_dev, moduli_dev,
+                        degree_inv_dev, N, logN, limb_count, dimBlock);
+        }
+        cudaEventRecord(stop);
+
+        inttLaunchErr = cudaGetLastError();
+        inttSyncErr = cudaEventSynchronize(stop);
+        profiler_range_pop();
+
+        if (inttLaunchErr == cudaSuccess && inttSyncErr == cudaSuccess) {
+            cudaEventElapsedTime(&intt_execution_time, start, stop);
+            intt_execution_time /= BENCHMARK_ITERATIONS;
+        }
+    }
+
+    if (inttLaunchErr != cudaSuccess) {
+        std::cout << "  [CUDA ERROR]: " << cudaGetErrorString(inttLaunchErr)
+                  << std::endl;
+    } else if (inttSyncErr != cudaSuccess) {
+        std::cout << "  [CUDA ERROR]: " << cudaGetErrorString(inttSyncErr)
+                  << std::endl;
+    } else {
+        print_time_result("Custom INTT kernel", intt_execution_time, ver_config);
     }
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
-    if (launchErr != cudaSuccess) {
-        std::cout << "  [CUDA ERROR]: " << cudaGetErrorString(launchErr) << std::endl;
-    } else if (syncErr != cudaSuccess) {
-        std::cout << "  [CUDA ERROR]: " << cudaGetErrorString(syncErr) << std::endl;
-    } else {
-        print_time_result("Custom kernel", execution_time, ver_config);
-    }
+    if (verify && nttLaunchErr == cudaSuccess && nttSyncErr == cudaSuccess &&
+        inttLaunchErr == cudaSuccess && inttSyncErr == cudaSuccess) {
+        cudaMemcpy(A_custom_dev, A_input_dev, bytes, cudaMemcpyDeviceToDevice);
+        launch_ntt(A_custom_dev, twiddle_dev, moduli_dev, N, logN,
+                   limb_count, dimBlock);
+        cudaError_t verifyNttLaunchErr = cudaGetLastError();
+        cudaError_t verifyNttSyncErr = cudaDeviceSynchronize();
 
-    if (verify && launchErr == cudaSuccess && syncErr == cudaSuccess) {
-        cudaMemcpy(out_host, A_custom_dev, bytes, cudaMemcpyDeviceToHost);
+        std::copy(A_host, A_host + total_values, A_ref_host);
         for (size_t limb = 0; limb < limb_count; ++limb) {
             cpu_ntt_butterfly(A_ref_host + limb * N, logN,
                               mod_runtime[limb].qi,
                               twiddle_table.data() + limb * N);
         }
 
-        if (validate(A_ref_host, out_host, total_values)) {
-            std::cout << ">>> Custom kernel test pass!" << std::endl;
+        bool nttOk = false;
+        if (verifyNttLaunchErr == cudaSuccess && verifyNttSyncErr == cudaSuccess) {
+            cudaMemcpy(out_host, A_custom_dev, bytes, cudaMemcpyDeviceToHost);
+            nttOk = validate(A_ref_host, out_host, total_values);
+        }
+
+        if (nttOk) {
+            std::cout << ">>> Custom NTT test pass!" << std::endl;
         } else {
-            std::cout << ">>> Custom kernel test fail!" << std::endl;
+            std::cout << ">>> Custom NTT test fail!" << std::endl;
+            if (verifyNttLaunchErr != cudaSuccess) {
+                std::cout << "  [CUDA ERROR]: "
+                          << cudaGetErrorString(verifyNttLaunchErr)
+                          << std::endl;
+            } else if (verifyNttSyncErr != cudaSuccess) {
+                std::cout << "  [CUDA ERROR]: "
+                          << cudaGetErrorString(verifyNttSyncErr)
+                          << std::endl;
+            }
+            std::cout << ">>> First 10 elements of answer:\n";
+            print_first_10(A_ref_host, total_values);
+            std::cout << ">>> First 10 elements of custom:\n";
+            print_first_10(out_host, total_values);
+        }
+
+        cudaMemcpy(A_custom_dev, A_input_dev, bytes, cudaMemcpyDeviceToDevice);
+        launch_ntt(A_custom_dev, twiddle_dev, moduli_dev, N, logN,
+                   limb_count, dimBlock);
+        launch_intt(A_custom_dev, inv_twiddle_dev, moduli_dev, degree_inv_dev,
+                    N, logN, limb_count, dimBlock);
+        cudaError_t verifyInttLaunchErr = cudaGetLastError();
+        cudaError_t verifyInttSyncErr = cudaDeviceSynchronize();
+
+        std::copy(A_host, A_host + total_values, A_ref_host);
+        for (size_t limb = 0; limb < limb_count; ++limb) {
+            cpu_ntt_butterfly(A_ref_host + limb * N, logN,
+                              mod_runtime[limb].qi,
+                              twiddle_table.data() + limb * N);
+            cpu_intt_butterfly(A_ref_host + limb * N, logN,
+                               mod_runtime[limb].qi,
+                               inv_twiddle_table.data() + limb * N,
+                               mod_runtime[limb].degree_inv);
+        }
+
+        bool inttOk = false;
+        if (verifyInttLaunchErr == cudaSuccess &&
+            verifyInttSyncErr == cudaSuccess) {
+            cudaMemcpy(out_host, A_custom_dev, bytes, cudaMemcpyDeviceToHost);
+            inttOk = validate(A_ref_host, out_host, total_values);
+        }
+
+        if (inttOk) {
+            std::cout << ">>> Custom INTT roundtrip test pass!" << std::endl;
+        } else {
+            std::cout << ">>> Custom INTT roundtrip test fail!" << std::endl;
+            if (verifyInttLaunchErr != cudaSuccess) {
+                std::cout << "  [CUDA ERROR]: "
+                          << cudaGetErrorString(verifyInttLaunchErr)
+                          << std::endl;
+            } else if (verifyInttSyncErr != cudaSuccess) {
+                std::cout << "  [CUDA ERROR]: "
+                          << cudaGetErrorString(verifyInttSyncErr)
+                          << std::endl;
+            }
             std::cout << ">>> First 10 elements of answer:\n";
             print_first_10(A_ref_host, total_values);
             std::cout << ">>> First 10 elements of custom:\n";
@@ -421,14 +651,18 @@ int main(int argc, char* argv[]) {
 
     cudaFree(A_input_dev);
     cudaFree(A_custom_dev);
+    cudaFree(A_ntt_input_dev);
     cudaFree(twiddle_dev);
+    cudaFree(inv_twiddle_dev);
     cudaFree(moduli_dev);
+    cudaFree(degree_inv_dev);
 
     delete[] A_host;
     delete[] A_ref_host;
     delete[] out_host;
 
-    bool customOk = (launchErr == cudaSuccess && syncErr == cudaSuccess);
+    bool customOk = (nttLaunchErr == cudaSuccess && nttSyncErr == cudaSuccess &&
+                     inttLaunchErr == cudaSuccess && inttSyncErr == cudaSuccess);
     bool allOk = customOk && !compare_base;
     return allOk ? 0 : 1;
 }

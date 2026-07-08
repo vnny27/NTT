@@ -9,10 +9,10 @@ This directory tracks CUDA NTT baseline and optimization versions.
 - Data type: `uint32_t`
 - Transform size: `N = 1 << logN`
 - Modulus layout: multi-limb RNS-style layout, `A[limb * N + i]`
-- Kernel shape: one CUDA kernel launch per NTT stage
-- Verification: CPU butterfly NTT with the same twiddle table
+- Kernel shape: one CUDA kernel launch per NTT/INTT stage
+- Verification: CPU butterfly NTT and NTT-to-INTT roundtrip
 
-The current benchmark restores the device input before each measured NTT. The reported time includes that device-to-device restore copy.
+The current benchmark restores the device input before each measured transform. The reported time includes that device-to-device restore copy.
 
 ## Build
 
@@ -124,14 +124,14 @@ Nsight Compute:
 
 ## Results Log
 
-The benchmark time currently includes restoring the device input before each NTT.
+The benchmark time currently includes restoring the device input before each transform.
 `default` refers to the config in `src/ntt_config.h`.
 
-| Version | Config | Limbs | Time (ms) | Throughput (GOp/s) | Notes |
-| --- | --- | ---: |  ---: | ---: | --- |
-| v00 | default | 16 | 0.078 | 323.995 | Per-stage kernel baseline |
-| v01 |  |  |  |  |  |
-| v02 |  |  |  |  |  |
+| Version | Config | Limbs | NTT Time (ms) | NTT GOp/s | INTT Time (ms) | INTT GOp/s | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| v00 | default | 16 | 0.078 | 323.995 | 0.089 | 283.712 | Per-stage kernel baseline |
+| v01 |  |  |  |  |  |  |  |
+| v02 |  |  |  |  |  |  |  |
 
 ## Version Notes
 
