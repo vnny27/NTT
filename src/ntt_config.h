@@ -8,10 +8,11 @@ struct ModulusConfig {
     uint32_t primitive_root;
 };
 
+// log2
 struct PhaseConfig {
     int radix_stages;      // log2(radix) handled by this phase
     int stage_merging;     // radix-2 stages fused in one local step
-    int log_warp_batching; // coalescing/batching factor for phase indexing
+    int warp_batching;     // coalescing/batching factor for phase indexing
 };
 
 struct TransformConfig {

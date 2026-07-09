@@ -34,6 +34,7 @@ struct ModulusRuntime {
 #endif
 
 #define BLOCK_DIM 256
+#define MAX_PHASE_MERGE 32
 
 __host__ __device__ inline uint32_t add_mod(uint32_t a, uint32_t b, uint32_t q) {
     uint64_t sum = static_cast<uint64_t>(a) + b;
@@ -74,22 +75,419 @@ __device__ inline void inverse_butterfly(uint32_t* A_limb,
     A_limb[a + t] = mul_mod(sub_mod(u, v, q), tw_limb[m + stage_block], q);
 }
 
-__global__ void NTTStage(uint32_t* A, const uint32_t* twiddles,
-                         const uint32_t* moduli, size_t N,
-                         size_t m, size_t t) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= (N >> 1)) {
+__device__ inline void butterfly_merge_stages(uint32_t* local,
+                                              const uint32_t* tw_limb,
+                                              uint32_t q, size_t merge,
+                                              size_t stages,
+                                              size_t tw_base) {
+    for (size_t stage = 0, m = 1, t = merge >> 1; stage < stages;
+         stage++, m <<= 1, t >>= 1) {
+        for (size_t j = 0; j < m; ++j) {
+            for (size_t k = j * 2 * t; k < j * 2 * t + t; ++k) {
+                uint32_t tw = tw_limb[(tw_base << stage) + j];
+                uint32_t u = local[k];
+                uint32_t v = mul_mod(local[k + t], tw, q);
+                local[k] = add_mod(u, v, q);
+                local[k + t] = sub_mod(u, v, q);
+            }
+        }
+    }
+}
+
+__device__ inline void inverse_butterfly_merge_stages(uint32_t* local,
+                                                      const uint32_t* tw_limb,
+                                                      uint32_t q,
+                                                      size_t merge,
+                                                      size_t stages,
+                                                      size_t tw_base) {
+    for (size_t stage = 0, m = size_t{1} << (stages - 1), t = merge >> stages;
+         stage < stages; stage++, m >>= 1, t <<= 1) {
+        size_t tw_shift = stages - 1 - stage;
+        for (size_t j = 0; j < m; ++j) {
+            for (size_t k = j * 2 * t; k < j * 2 * t + t; ++k) {
+                uint32_t tw = tw_limb[(tw_base << tw_shift) + j];
+                uint32_t u = local[k];
+                uint32_t v = local[k + t];
+                local[k] = add_mod(u, v, q);
+                local[k + t] = mul_mod(sub_mod(u, v, q), tw, q);
+            }
+        }
+    }
+}
+
+__global__ void NTTPhase1(uint32_t* A, const uint32_t* twiddles,
+                          const uint32_t* moduli, int logN,
+                          int radix_stages, int stage_merging,
+                          int warp_batching) {
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    uint64_t N = uint64_t{1} << logN;
+    size_t merge = size_t{1} << stage_merging;
+    size_t batch = size_t{1} << warp_batching;
+    size_t merge_log_stride = logN - stage_merging;
+    size_t radix_log_stride = logN - radix_stages;
+    extern __shared__ uint32_t A_radix[];
+    uint32_t local[MAX_PHASE_MERGE];
+    if (merge > MAX_PHASE_MERGE) {
         return;
     }
 
-    size_t limb = blockIdx.y;
+    int limb = blockIdx.y;
     uint32_t q = moduli[limb];
     uint32_t* A_limb = A + limb * N;
     const uint32_t* tw_limb = twiddles + limb * N;
 
-    size_t stage_block = tid / t;
-    size_t stage_id = tid % t;
-    butterfly(A_limb, tw_limb, t, stage_block, stage_id, m, q);
+    size_t batch_block = static_cast<size_t>(tid) >> warp_batching;
+    size_t batch_id = static_cast<size_t>(tid) & (batch - 1);
+
+    size_t tail_stages = (radix_stages - 1) % stage_merging + 1;
+    size_t merge_stages = (radix_stages - 1) / stage_merging;
+
+    size_t input_base =
+        (batch_block << radix_log_stride) +
+        (static_cast<size_t>(bid) << warp_batching) +
+        batch_id;
+
+    for (size_t i = 0; i < merge; i++) {
+        local[i] = A_limb[input_base + (i << merge_log_stride)];
+    }
+
+    butterfly_merge_stages(local, tw_limb, q, merge, tail_stages, 1);
+
+    size_t tid_s = static_cast<size_t>(tid);
+    if (merge_stages > 0) {
+        size_t sm_log_stride = radix_stages - stage_merging + warp_batching;
+        for (size_t i = 0; i < merge; i++) {
+            A_radix[tid_s + (i << sm_log_stride)] = local[i];
+        }
+
+        __syncthreads();
+
+        sm_log_stride -= tail_stages;
+        for (size_t i = 0; i + 1 < merge_stages; i++) {
+            size_t sm_base =
+                ((tid_s >> sm_log_stride) << (sm_log_stride + stage_merging)) +
+                (tid_s & ((size_t{1} << sm_log_stride) - 1));
+            for (size_t j = 0; j < merge; j++) {
+                local[j] = A_radix[sm_base + (j << sm_log_stride)];
+            }
+
+            size_t tw_base = (size_t{1} << (tail_stages + i * stage_merging))
+                             + (tid_s >> sm_log_stride);
+            butterfly_merge_stages(local, tw_limb, q, merge, stage_merging,
+                                   tw_base);
+
+            for (size_t j = 0; j < merge; j++) {
+                A_radix[sm_base + (j << sm_log_stride)] = local[j];
+            }
+            sm_log_stride -= stage_merging;
+            __syncthreads();
+        }
+
+        size_t i = merge_stages - 1;
+        size_t sm_base =
+            ((tid_s >> sm_log_stride) << (sm_log_stride + stage_merging)) +
+            (tid_s & ((size_t{1} << sm_log_stride) - 1));
+        for (size_t j = 0; j < merge; j++) {
+            local[j] = A_radix[sm_base + (j << sm_log_stride)];
+        }
+
+        size_t tw_base = (size_t{1} << (tail_stages + i * stage_merging))
+                         + (tid_s >> sm_log_stride);
+        butterfly_merge_stages(local, tw_limb, q, merge, stage_merging,
+                               tw_base);
+    }
+
+    size_t dst_base =
+        batch_id +
+        (batch_block << ((logN - radix_stages) + stage_merging)) +
+        (static_cast<size_t>(bid) << warp_batching);
+    for (size_t i = 0; i < merge; i++) {
+        A_limb[dst_base + (i << radix_log_stride)] = local[i];
+    }
+}
+
+__global__ void NTTPhase2(uint32_t* A, const uint32_t* twiddles,
+                          const uint32_t* moduli, int logN,
+                          int radix_stages, int stage_merging,
+                          int warp_batching) {
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    uint64_t N = uint64_t{1} << logN;
+    size_t merge = size_t{1} << stage_merging;
+    size_t ph1_radix = size_t{1} << (logN - radix_stages);
+    size_t group_log_width = radix_stages - stage_merging;
+    size_t group_width = size_t{1} << group_log_width;
+    size_t groups_in_block = static_cast<size_t>(blockDim.x) >> group_log_width;
+    extern __shared__ uint32_t A_radix[];
+    uint32_t local[MAX_PHASE_MERGE];
+    if (merge > MAX_PHASE_MERGE) {
+        return;
+    }
+    (void)warp_batching;
+
+    int limb = blockIdx.y;
+    uint32_t q = moduli[limb];
+    uint32_t* A_limb = A + limb * N;
+    const uint32_t* tw_limb = twiddles + limb * N;
+
+    size_t group_id = static_cast<size_t>(tid) >> group_log_width;
+    size_t group_element = static_cast<size_t>(tid) & (group_width - 1);
+    size_t global_segment = static_cast<size_t>(bid) * groups_in_block + group_id;
+    size_t segment_offset = global_segment << radix_stages;
+
+    size_t tail_stages = (radix_stages - 1) % stage_merging + 1;
+    size_t merge_stages = (radix_stages - 1) / stage_merging;
+
+    size_t input_base = segment_offset + group_element;
+
+    for (size_t i = 0; i < merge; i++) {
+        local[i] = A_limb[input_base + (i << group_log_width)];
+    }
+
+    butterfly_merge_stages(local, tw_limb, q, merge, tail_stages,
+                           ph1_radix + global_segment);
+
+    size_t sm_segment_offset = group_id << radix_stages;
+    if (merge_stages > 0) {
+        size_t sm_log_stride = radix_stages - stage_merging;
+        for (size_t i = 0; i < merge; i++) {
+            A_radix[sm_segment_offset + group_element +
+                    (i << sm_log_stride)] = local[i];
+        }
+
+        __syncthreads();
+
+        sm_log_stride -= tail_stages;
+        for (size_t i = 0; i + 1 < merge_stages; i++) {
+            size_t sm_base =
+                sm_segment_offset +
+                ((group_element >> sm_log_stride)
+                 << (sm_log_stride + stage_merging)) +
+                (group_element & ((size_t{1} << sm_log_stride) - 1));
+            for (size_t j = 0; j < merge; j++) {
+                local[j] = A_radix[sm_base + (j << sm_log_stride)];
+            }
+
+            size_t tw_base =
+                ((ph1_radix + global_segment)
+                 << (tail_stages + i * stage_merging)) +
+                (group_element >> sm_log_stride);
+            butterfly_merge_stages(local, tw_limb, q, merge, stage_merging,
+                                   tw_base);
+
+            for (size_t j = 0; j < merge; j++) {
+                A_radix[sm_base + (j << sm_log_stride)] = local[j];
+            }
+            sm_log_stride -= stage_merging;
+            __syncthreads();
+        }
+
+        size_t i = merge_stages - 1;
+        size_t sm_base =
+            sm_segment_offset +
+            ((group_element >> sm_log_stride)
+             << (sm_log_stride + stage_merging)) +
+            (group_element & ((size_t{1} << sm_log_stride) - 1));
+        for (size_t j = 0; j < merge; j++) {
+            local[j] = A_radix[sm_base + (j << sm_log_stride)];
+        }
+
+        size_t tw_base =
+            ((ph1_radix + global_segment)
+             << (tail_stages + i * stage_merging)) +
+            (group_element >> sm_log_stride);
+        butterfly_merge_stages(local, tw_limb, q, merge, stage_merging,
+                               tw_base);
+    }
+
+    size_t dst_base = segment_offset + (group_element << stage_merging);
+    for (size_t i = 0; i < merge; i++) {
+        A_limb[dst_base + i] = local[i];
+    }
+}
+
+__global__ void INTTPhase1(uint32_t* A, const uint32_t* inv_twiddles,
+                           const uint32_t* moduli, int logN,
+                           int radix_stages, int stage_merging,
+                           int warp_batching) {
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    uint64_t N = uint64_t{1} << logN;
+    size_t merge = size_t{1} << stage_merging;
+    size_t ph2_radix = size_t{1} << (logN - radix_stages);
+    size_t group_log_width = radix_stages - stage_merging;
+    size_t group_width = size_t{1} << group_log_width;
+    size_t groups_in_block = static_cast<size_t>(blockDim.x) >> group_log_width;
+    extern __shared__ uint32_t A_radix[];
+    uint32_t local[MAX_PHASE_MERGE];
+    if (merge > MAX_PHASE_MERGE) {
+        return;
+    }
+    (void)warp_batching;
+
+    int limb = blockIdx.y;
+    uint32_t q = moduli[limb];
+    uint32_t* A_limb = A + limb * N;
+    const uint32_t* tw_limb = inv_twiddles + limb * N;
+
+    size_t group_id = static_cast<size_t>(tid) >> group_log_width;
+    size_t group_element = static_cast<size_t>(tid) & (group_width - 1);
+    size_t global_segment = static_cast<size_t>(bid) * groups_in_block + group_id;
+    size_t segment_offset = global_segment << radix_stages;
+
+    size_t tail_stages = (radix_stages - 1) % stage_merging + 1;
+    size_t merge_stages = (radix_stages - 1) / stage_merging;
+
+    size_t input_base = segment_offset + (group_element << stage_merging);
+    for (size_t i = 0; i < merge; i++) {
+        local[i] = A_limb[input_base + i];
+    }
+
+    size_t sm_segment_offset = group_id << radix_stages;
+    if (merge_stages > 0) {
+        size_t sm_log_stride = 0;
+        for (size_t i = merge_stages; i > 0; i--) {
+            size_t merge_stage = i - 1;
+            size_t sm_base =
+                sm_segment_offset +
+                ((group_element >> sm_log_stride)
+                 << (sm_log_stride + stage_merging)) +
+                (group_element & ((size_t{1} << sm_log_stride) - 1));
+            size_t tw_base =
+                ((ph2_radix + global_segment)
+                 << (tail_stages + merge_stage * stage_merging)) +
+                (group_element >> sm_log_stride);
+
+            inverse_butterfly_merge_stages(local, tw_limb, q, merge,
+                                           stage_merging, tw_base);
+
+            for (size_t j = 0; j < merge; j++) {
+                A_radix[sm_base + (j << sm_log_stride)] = local[j];
+            }
+            __syncthreads();
+
+            if (merge_stage > 0) {
+                sm_log_stride += stage_merging;
+                sm_base =
+                    sm_segment_offset +
+                    ((group_element >> sm_log_stride)
+                     << (sm_log_stride + stage_merging)) +
+                    (group_element & ((size_t{1} << sm_log_stride) - 1));
+                for (size_t j = 0; j < merge; j++) {
+                    local[j] = A_radix[sm_base + (j << sm_log_stride)];
+                }
+            }
+        }
+
+        size_t tail_sm_log_stride = sm_log_stride + tail_stages;
+        size_t sm_base =
+            sm_segment_offset +
+            ((group_element >> tail_sm_log_stride)
+             << (tail_sm_log_stride + stage_merging)) +
+            (group_element & ((size_t{1} << tail_sm_log_stride) - 1));
+        for (size_t j = 0; j < merge; j++) {
+            local[j] = A_radix[sm_base + (j << tail_sm_log_stride)];
+        }
+    }
+
+    inverse_butterfly_merge_stages(local, tw_limb, q, merge, tail_stages,
+                                   ph2_radix + global_segment);
+
+    size_t output_base = segment_offset + group_element;
+    for (size_t i = 0; i < merge; i++) {
+        A_limb[output_base + (i << group_log_width)] = local[i];
+    }
+}
+
+__global__ void INTTPhase2(uint32_t* A, const uint32_t* inv_twiddles,
+                           const uint32_t* moduli, int logN,
+                           int radix_stages, int stage_merging,
+                           int warp_batching) {
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    uint64_t N = uint64_t{1} << logN;
+    size_t merge = size_t{1} << stage_merging;
+    size_t batch = size_t{1} << warp_batching;
+    size_t merge_log_stride = logN - stage_merging;
+    size_t radix_log_stride = logN - radix_stages;
+    extern __shared__ uint32_t A_radix[];
+    uint32_t local[MAX_PHASE_MERGE];
+    if (merge > MAX_PHASE_MERGE) {
+        return;
+    }
+
+    int limb = blockIdx.y;
+    uint32_t q = moduli[limb];
+    uint32_t* A_limb = A + limb * N;
+    const uint32_t* tw_limb = inv_twiddles + limb * N;
+
+    size_t batch_block = static_cast<size_t>(tid) >> warp_batching;
+    size_t batch_id = static_cast<size_t>(tid) & (batch - 1);
+
+    size_t tail_stages = (radix_stages - 1) % stage_merging + 1;
+    size_t merge_stages = (radix_stages - 1) / stage_merging;
+
+    size_t input_base =
+        (batch_block << radix_log_stride) +
+        (static_cast<size_t>(bid) << warp_batching) +
+        batch_id;
+    size_t output_base =
+        batch_id +
+        (batch_block << ((logN - radix_stages) + stage_merging)) +
+        (static_cast<size_t>(bid) << warp_batching);
+
+    for (size_t i = 0; i < merge; i++) {
+        local[i] = A_limb[output_base + (i << radix_log_stride)];
+    }
+
+    size_t tid_s = static_cast<size_t>(tid);
+    if (merge_stages > 0) {
+        size_t sm_log_stride = warp_batching;
+        for (size_t i = merge_stages; i > 0; i--) {
+            size_t merge_stage = i - 1;
+            size_t sm_base =
+                ((tid_s >> sm_log_stride) << (sm_log_stride + stage_merging)) +
+                (tid_s & ((size_t{1} << sm_log_stride) - 1));
+            size_t tw_base =
+                (size_t{1} << (tail_stages + merge_stage * stage_merging)) +
+                (tid_s >> sm_log_stride);
+
+            inverse_butterfly_merge_stages(local, tw_limb, q, merge,
+                                           stage_merging, tw_base);
+
+            for (size_t j = 0; j < merge; j++) {
+                A_radix[sm_base + (j << sm_log_stride)] = local[j];
+            }
+            __syncthreads();
+
+            if (merge_stage > 0) {
+                sm_log_stride += stage_merging;
+                sm_base =
+                    ((tid_s >> sm_log_stride)
+                     << (sm_log_stride + stage_merging)) +
+                    (tid_s & ((size_t{1} << sm_log_stride) - 1));
+                for (size_t j = 0; j < merge; j++) {
+                    local[j] = A_radix[sm_base + (j << sm_log_stride)];
+                }
+            }
+        }
+
+        size_t tail_sm_log_stride = sm_log_stride + tail_stages;
+        size_t sm_base =
+            ((tid_s >> tail_sm_log_stride)
+             << (tail_sm_log_stride + stage_merging)) +
+            (tid_s & ((size_t{1} << tail_sm_log_stride) - 1));
+        for (size_t j = 0; j < merge; j++) {
+            local[j] = A_radix[sm_base + (j << tail_sm_log_stride)];
+        }
+    }
+
+    inverse_butterfly_merge_stages(local, tw_limb, q, merge, tail_stages, 1);
+
+    for (size_t i = 0; i < merge; i++) {
+        A_limb[input_base + (i << merge_log_stride)] = local[i];
+    }
 }
 
 __global__ void INTTStage(uint32_t* A, const uint32_t* inv_twiddles,
@@ -122,42 +520,73 @@ __global__ void NormalizeKernel(uint32_t* A, const uint32_t* moduli,
     A[limb * N + tid] = mul_mod(A[limb * N + tid], degree_inv[limb], q);
 }
 
-void launch_ntt(uint32_t* A_dev, const uint32_t* twiddle_dev,
-                const uint32_t* moduli_dev, size_t N, int logN,
-                size_t limb_count, dim3 dimBlock) {
-    size_t butterflies = N >> 1;
-    unsigned int grid_x =
-        static_cast<unsigned int>((butterflies + dimBlock.x - 1) / dimBlock.x);
-    dim3 dimGrid(grid_x, static_cast<unsigned int>(limb_count), 1);
+dim3 phase_block_dim(const PhaseConfig& phase) {
+    int block_log_width =
+        phase.radix_stages - phase.stage_merging + phase.warp_batching;
+    return dim3(1u << block_log_width);
+}
 
-    size_t t = N >> 1;
-    for (int stage = 0; stage < logN; ++stage) {
-        size_t m = size_t{1} << stage;
-        NTTStage<<<dimGrid, dimBlock>>>(A_dev, twiddle_dev, moduli_dev, N, m, t);
-        t >>= 1;
-    }
+dim3 phase_grid_dim(size_t N, size_t limb_count, const PhaseConfig& phase,
+                    dim3 block) {
+    size_t phase_threads = N >> phase.stage_merging;
+    unsigned int grid_x =
+        static_cast<unsigned int>((phase_threads + block.x - 1) / block.x);
+    return dim3(grid_x, static_cast<unsigned int>(limb_count), 1);
+}
+
+size_t phase_shared_bytes(const PhaseConfig& phase, dim3 block) {
+    return (static_cast<size_t>(block.x) << phase.stage_merging) *
+           sizeof(uint32_t);
+}
+
+void launch_ntt(uint32_t* A_dev, const uint32_t* twiddle_dev,
+                const uint32_t* moduli_dev, const VersionConfig& config,
+                size_t limb_count) {
+    size_t N = size_t{1} << config.logN;
+    const PhaseConfig& phase1 = config.transform.ntt_phase1;
+    const PhaseConfig& phase2 = config.transform.ntt_phase2;
+
+    dim3 phase1_block = phase_block_dim(phase1);
+    dim3 phase1_grid = phase_grid_dim(N, limb_count, phase1, phase1_block);
+    size_t phase1_shared = phase_shared_bytes(phase1, phase1_block);
+    NTTPhase1<<<phase1_grid, phase1_block, phase1_shared>>>(
+        A_dev, twiddle_dev, moduli_dev, config.logN, phase1.radix_stages,
+        phase1.stage_merging, phase1.warp_batching);
+
+    dim3 phase2_block = phase_block_dim(phase2);
+    dim3 phase2_grid = phase_grid_dim(N, limb_count, phase2, phase2_block);
+    size_t phase2_shared = phase_shared_bytes(phase2, phase2_block);
+    NTTPhase2<<<phase2_grid, phase2_block, phase2_shared>>>(
+        A_dev, twiddle_dev, moduli_dev, config.logN, phase2.radix_stages,
+        phase2.stage_merging, phase2.warp_batching);
 }
 
 void launch_intt(uint32_t* A_dev, const uint32_t* inv_twiddle_dev,
                  const uint32_t* moduli_dev, const uint32_t* degree_inv_dev,
-                 size_t N, int logN, size_t limb_count, dim3 dimBlock) {
-    size_t butterflies = N >> 1;
-    unsigned int grid_x =
-        static_cast<unsigned int>((butterflies + dimBlock.x - 1) / dimBlock.x);
-    dim3 dimGrid(grid_x, static_cast<unsigned int>(limb_count), 1);
+                 const VersionConfig& config, size_t limb_count) {
+    size_t N = size_t{1} << config.logN;
+    const PhaseConfig& phase1 = config.transform.intt_phase1;
+    const PhaseConfig& phase2 = config.transform.intt_phase2;
 
-    size_t t = 1;
-    for (int stage = logN - 1; stage >= 0; --stage) {
-        size_t m = size_t{1} << stage;
-        INTTStage<<<dimGrid, dimBlock>>>(
-            A_dev, inv_twiddle_dev, moduli_dev, N, m, t);
-        t <<= 1;
-    }
+    dim3 phase1_block = phase_block_dim(phase1);
+    dim3 phase1_grid = phase_grid_dim(N, limb_count, phase1, phase1_block);
+    size_t phase1_shared = phase_shared_bytes(phase1, phase1_block);
+    INTTPhase1<<<phase1_grid, phase1_block, phase1_shared>>>(
+        A_dev, inv_twiddle_dev, moduli_dev, config.logN, phase1.radix_stages,
+        phase1.stage_merging, phase1.warp_batching);
 
+    dim3 phase2_block = phase_block_dim(phase2);
+    dim3 phase2_grid = phase_grid_dim(N, limb_count, phase2, phase2_block);
+    size_t phase2_shared = phase_shared_bytes(phase2, phase2_block);
+    INTTPhase2<<<phase2_grid, phase2_block, phase2_shared>>>(
+        A_dev, inv_twiddle_dev, moduli_dev, config.logN, phase2.radix_stages,
+        phase2.stage_merging, phase2.warp_batching);
+
+    dim3 normalizeBlock(BLOCK_DIM);
     unsigned int normalize_grid_x =
-        static_cast<unsigned int>((N + dimBlock.x - 1) / dimBlock.x);
+        static_cast<unsigned int>((N + normalizeBlock.x - 1) / normalizeBlock.x);
     dim3 normalizeGrid(normalize_grid_x, static_cast<unsigned int>(limb_count), 1);
-    NormalizeKernel<<<normalizeGrid, dimBlock>>>(
+    NormalizeKernel<<<normalizeGrid, normalizeBlock>>>(
         A_dev, moduli_dev, degree_inv_dev, N);
 }
 
@@ -465,16 +894,14 @@ int main(int argc, char* argv[]) {
     cudaMemcpy(degree_inv_dev, degree_inv_host.data(), moduli_bytes,
                cudaMemcpyHostToDevice);
 
-    dim3 dimBlock(BLOCK_DIM, 1, 1);
-
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
     for (int i = 0; i < WARMUP_ITERATIONS; ++i) {
         cudaMemcpy(A_custom_dev, A_input_dev, bytes, cudaMemcpyDeviceToDevice);
-        launch_ntt(A_custom_dev, twiddle_dev, moduli_dev, N, logN,
-                   limb_count, dimBlock);
+        launch_ntt(A_custom_dev, twiddle_dev, moduli_dev, ver_config,
+                   limb_count);
     }
     cudaDeviceSynchronize();
 
@@ -483,8 +910,8 @@ int main(int argc, char* argv[]) {
     cudaEventRecord(start);
     for (int i = 0; i < BENCHMARK_ITERATIONS; ++i) {
         cudaMemcpy(A_custom_dev, A_input_dev, bytes, cudaMemcpyDeviceToDevice);
-        launch_ntt(A_custom_dev, twiddle_dev, moduli_dev, N, logN,
-                   limb_count, dimBlock);
+        launch_ntt(A_custom_dev, twiddle_dev, moduli_dev, ver_config,
+                   limb_count);
     }
     cudaEventRecord(stop);
 
@@ -509,8 +936,8 @@ int main(int argc, char* argv[]) {
     }
 
     cudaMemcpy(A_ntt_input_dev, A_input_dev, bytes, cudaMemcpyDeviceToDevice);
-    launch_ntt(A_ntt_input_dev, twiddle_dev, moduli_dev, N, logN,
-               limb_count, dimBlock);
+    launch_ntt(A_ntt_input_dev, twiddle_dev, moduli_dev, ver_config,
+               limb_count);
     cudaError_t prepLaunchErr = cudaGetLastError();
     cudaError_t prepSyncErr = cudaDeviceSynchronize();
 
@@ -522,7 +949,7 @@ int main(int argc, char* argv[]) {
             cudaMemcpy(A_custom_dev, A_ntt_input_dev, bytes,
                        cudaMemcpyDeviceToDevice);
             launch_intt(A_custom_dev, inv_twiddle_dev, moduli_dev,
-                        degree_inv_dev, N, logN, limb_count, dimBlock);
+                        degree_inv_dev, ver_config, limb_count);
         }
         cudaDeviceSynchronize();
 
@@ -533,7 +960,7 @@ int main(int argc, char* argv[]) {
             cudaMemcpy(A_custom_dev, A_ntt_input_dev, bytes,
                        cudaMemcpyDeviceToDevice);
             launch_intt(A_custom_dev, inv_twiddle_dev, moduli_dev,
-                        degree_inv_dev, N, logN, limb_count, dimBlock);
+                        degree_inv_dev, ver_config, limb_count);
         }
         cudaEventRecord(stop);
 
@@ -563,8 +990,8 @@ int main(int argc, char* argv[]) {
     if (verify && nttLaunchErr == cudaSuccess && nttSyncErr == cudaSuccess &&
         inttLaunchErr == cudaSuccess && inttSyncErr == cudaSuccess) {
         cudaMemcpy(A_custom_dev, A_input_dev, bytes, cudaMemcpyDeviceToDevice);
-        launch_ntt(A_custom_dev, twiddle_dev, moduli_dev, N, logN,
-                   limb_count, dimBlock);
+        launch_ntt(A_custom_dev, twiddle_dev, moduli_dev, ver_config,
+                   limb_count);
         cudaError_t verifyNttLaunchErr = cudaGetLastError();
         cudaError_t verifyNttSyncErr = cudaDeviceSynchronize();
 
@@ -601,10 +1028,10 @@ int main(int argc, char* argv[]) {
         }
 
         cudaMemcpy(A_custom_dev, A_input_dev, bytes, cudaMemcpyDeviceToDevice);
-        launch_ntt(A_custom_dev, twiddle_dev, moduli_dev, N, logN,
-                   limb_count, dimBlock);
+        launch_ntt(A_custom_dev, twiddle_dev, moduli_dev, ver_config,
+                   limb_count);
         launch_intt(A_custom_dev, inv_twiddle_dev, moduli_dev, degree_inv_dev,
-                    N, logN, limb_count, dimBlock);
+                    ver_config, limb_count);
         cudaError_t verifyInttLaunchErr = cudaGetLastError();
         cudaError_t verifyInttSyncErr = cudaDeviceSynchronize();
 
@@ -646,7 +1073,8 @@ int main(int argc, char* argv[]) {
         }
 
     } else if (verify) {
-        std::cout << ">>> Verification skipped because the kernel did not complete successfully."
+        std::cout << ">>> Verification skipped because the kernel did not complete "
+                     "successfully."
                   << std::endl;
     } else {
         std::cout << ">>> Verification skipped. Use --verify to enable it."

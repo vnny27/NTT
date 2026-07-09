@@ -2,17 +2,31 @@
 
 This directory tracks CUDA NTT baseline and optimization versions.
 
-## Current Baseline
+## Environment
+
+| Item | Value |
+| --- | --- |
+| GPU | NVIDIA GeForce RTX 4090  |
+| Driver version | 590.48.01 |
+| CUDA version | 13.1 |
+
+## Versions
 
 `src/v00_base_ntt.cu` is the first correctness-oriented GPU baseline.
+`src/v01_radix_stages.cu` is the first phase-split radix-staged version.
 
 - Data type: `uint32_t`
 - Transform size: `N = 1 << logN`
 - Modulus layout: multi-limb RNS-style layout, `A[limb * N + i]`
-- Kernel shape: one CUDA kernel launch per NTT/INTT stage
 - Verification: CPU butterfly NTT and NTT-to-INTT roundtrip
 
-The current benchmark restores the device input before each measured transform. The reported time includes that device-to-device restore copy.
+Kernel shape by version:
+
+- `v00`: one CUDA kernel launch per radix-2 NTT/INTT stage
+- `v01`: two phase kernels for NTT/INTT, with stage merging inside each phase
+
+The current benchmark restores the device input before each measured transform.
+The reported time includes that device-to-device restore copy.
 
 ## Build
 
@@ -20,15 +34,17 @@ From this directory:
 
 ```bash
 /usr/local/cuda/bin/nvcc -O3 -arch=sm_89 \
-  src/v00_base_ntt.cu -o v00_base_ntt
+  src/<version>.cu -o <version>
 ```
+
+For example, `src/v01_radix_stages.cu` builds to `./v01_radix_stages`.
 
 With NVTX ranges for Nsight:
 
 ```bash
 /usr/local/cuda/bin/nvcc -O3 -arch=sm_89 -DUSE_NVTX \
   -I /usr/local/cuda-13.1/targets/x86_64-linux/include/nvtx3 \
-  src/v00_base_ntt.cu -o v00_base_ntt
+  src/<version>.cu -o <version>
 ```
 
 When `USE_NVTX` is enabled, `BENCHMARK_ITERATIONS` is set to `1` to keep profiling traces compact.
@@ -40,20 +56,20 @@ Adjust `sm_89` if the target GPU uses a different architecture.
 Benchmark only:
 
 ```bash
-./v00_base_ntt
+./<version>
 ```
 
 Benchmark and verify against the CPU reference:
 
 ```bash
-./v00_base_ntt --verify
+./<version> --verify
 ```
 
 Short aliases:
 
 ```bash
-./v00_base_ntt -v
-./v00_base_ntt -h
+./<version> -v
+./<version> -h
 ```
 
 `--base` is accepted by the harness, but no external NTT library comparison is implemented yet.
@@ -123,13 +139,15 @@ For each phase config, the fields are:
 - `stage_merging`: radix-2 stages fused inside one local register/shared-memory step.
 - `log_warp_batching`: batching factor used by phase indexing to improve coalescing.
 
+The phase config fields are used by phase-based versions such as `v01`.
+
 ## Profiling
 
 Nsight Systems:
 
 ```bash
 nsys profile --trace=cuda,nvtx --stats=true \
-  -o ntt_v00_nsys ./v00_base_ntt --verify
+  -o ntt_<version>_nsys ./<version> --verify
 ```
 
 Nsight Compute:
@@ -137,7 +155,7 @@ Nsight Compute:
 ```bash
 /usr/local/cuda-13.1/bin/ncu --set full --target-processes all \
   --nvtx --nvtx-include "custom_ntt/" \
-  -o ntt_v00_ncu ./v00_base_ntt
+  -o ntt_<version>_ncu ./<version>
 ```
 
 ## Results Log
@@ -147,8 +165,8 @@ The benchmark time currently includes restoring the device input before each tra
 
 | Version | Config | Limbs | NTT Time (ms) | NTT GOp/s | INTT Time (ms) | INTT GOp/s | Notes |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| v00 | default | 16 | 0.078 | 323.995 | 0.089 | 283.712 | Per-stage kernel baseline |
-| v01 |  |  |  |  |  |  |  |
+| v00 | default | 16 | 0.078 | 323.995 | 0.089 | 283.712 | One kernel launch per radix-2 stage |
+| v01 | default | 16 | 0.0673 | 378.092 | 0.073 | 346.141 | Two-phase radix-staged kernel with stage merging |
 | v02 |  |  |  |  |  |  |  |
 
 ## Version Notes
@@ -156,7 +174,7 @@ The benchmark time currently includes restoring the device input before each tra
 Use this pattern when adding later versions:
 
 - `v00_base_ntt.cu`: naive per-stage GPU baseline
-- `v01_*.cu`: first optimization
+- `v01_radix_stages.cu`: phase-split radix-staged kernel
 - `v02_*.cu`: next optimization
 
 For each new version, record:
