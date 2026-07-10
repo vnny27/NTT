@@ -14,6 +14,10 @@ This directory tracks CUDA NTT baseline and optimization versions.
 
 `src/v00_base_ntt.cu` is the first correctness-oriented GPU baseline.
 `src/v01_radix_stages.cu` is the first phase-split radix-staged version.
+`src/v02_vectorized_io.cu` adds vectorized phase-boundary IO to v01.
+`src/v03_template_config.cu` specializes the phase config with templates.
+`src/v04_montgomery.cu` uses Montgomery multiplication with fused normal input
+conversion in NTT Phase1.
 
 - Data type: `uint32_t`
 - Transform size: `N = 1 << logN`
@@ -24,9 +28,14 @@ Kernel shape by version:
 
 - `v00`: one CUDA kernel launch per radix-2 NTT/INTT stage
 - `v01`: two phase kernels for NTT/INTT, with stage merging inside each phase
+- `v02`: v01 plus vectorized NTT Phase2 store and INTT Phase1 load
+- `v03`: v02 plus template-specialized launch config and phase kernels
+- `v04`: v03 plus Montgomery-domain twiddles and modular multiplication
 
 The current benchmark restores the device input before each measured transform.
 The reported time includes that device-to-device restore copy.
+For `v04`, NTT starts from normal-domain input and converts it to Montgomery form
+inside NTT Phase1. INTT includes the final Montgomery-to-normal conversion.
 
 ## Build
 
@@ -39,6 +48,19 @@ From this directory:
 
 For example, `src/v01_radix_stages.cu` builds to `./v01_radix_stages`.
 
+`src/cheddar_ntt_bench.cu` is a separate timing-only comparison against
+Cheddar's `NTTHandler`. The local CMake target builds only the Cheddar NTT
+sources needed for timing, so GMP/libtommath is not required.
+
+Cheddar comparison build:
+
+```bash
+cmake -S . -B build-cheddar -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=89
+cmake --build build-cheddar --target cheddar_ntt_bench -j
+./build-cheddar/cheddar_ntt_bench --verify
+```
+
 With NVTX ranges for Nsight:
 
 ```bash
@@ -47,7 +69,8 @@ With NVTX ranges for Nsight:
   src/<version>.cu -o <version>
 ```
 
-When `USE_NVTX` is enabled, `BENCHMARK_ITERATIONS` is set to `1` to keep profiling traces compact.
+When `USE_NVTX` is enabled, `BENCHMARK_ITERATIONS` is set to `1` to keep
+profiling traces compact.
 
 Adjust `sm_89` if the target GPU uses a different architecture.
 
@@ -72,40 +95,37 @@ Short aliases:
 ./<version> -h
 ```
 
-`--base` is accepted by the harness, but no external NTT library comparison is implemented yet.
-
 ## Config
 
 Edit the shared config in `src/ntt_config.h`:
 
 ```cpp
-inline VersionConfig default_ntt_config() {
+using LaunchConfig = DefaultNTTLaunchConfig<16>;
+VersionConfig ver_config = make_version_config<LaunchConfig>();
+```
+
+`DefaultNTTLaunchConfig<LogN>` derives the phase config from `LogN`:
+
+```cpp
+NTT Phase1 / INTT Phase2:
+    radix_stages = LogN == 16 ? 7 : LogN - 9
+    stage_merging = LogN == 16 ? 4 : 3
+    warp_batching = 4
+
+NTT Phase2 / INTT Phase1:
+    radix_stages = 9
+    stage_merging = 3
+    warp_batching = 0
+```
+
+The modulus limbs live in `default_moduli()`:
+
+```cpp
+inline std::vector<ModulusConfig> default_moduli() {
     return {
-        16,
-        {
-            {974258177u, 3u},
-            {1081212929u, 6u},
-            {1196556289u, 7u},
-            {993263617u, 5u},
-            {989986817u, 3u},
-            {1074266113u, 5u},
-            {1168900097u, 5u},
-            {1010565121u, 7u},
-            {957349889u, 6u},
-            {1073872897u, 7u},
-            {1209139201u, 31u},
-            {994705409u, 3u},
-            {998244353u, 3u},
-            {1073479681u, 11u},
-            {1158676481u, 3u},
-            {1016463361u, 38u},
-        },
-        {
-            {7, 4, 4}, // NTT phase 1
-            {9, 3, 0}, // NTT phase 2
-            {9, 3, 0}, // INTT phase 1
-            {7, 4, 4}, // INTT phase 2
-        },
+        {974258177u, 3u},
+        // ...
+        {1016463361u, 38u},
     };
 }
 ```
@@ -132,14 +152,31 @@ Inputs, outputs, twiddles, and CPU verification are then handled per limb.
 For each phase config, the fields are:
 
 ```cpp
-{radix_stages, stage_merging, log_warp_batching}
+{radix_stages, stage_merging, warp_batching}
 ```
 
 - `radix_stages`: `log2(radix)` handled by the phase.
 - `stage_merging`: radix-2 stages fused inside one local register/shared-memory step.
-- `log_warp_batching`: batching factor used by phase indexing to improve coalescing.
+- `warp_batching`: batching factor used by phase indexing to improve coalescing.
 
-The phase config fields are used by phase-based versions such as `v01`.
+`v01` and `v02` consume these values at runtime through `VersionConfig`.
+`v03` and `v04` use the same config as compile-time template parameters.
+
+## Montgomery Variant
+
+`src/v04_montgomery.cu` keeps twiddles and `degree_inv` in Montgomery form.
+The input stored on the device is normal-domain input. NTT Phase1 converts each
+loaded coefficient with:
+
+```cpp
+mont_mul(x, R^2 mod qi)
+```
+
+because Montgomery multiplication returns `a * b * R^-1 mod qi`, so
+`mont_mul(x, R^2)` produces `x * R mod qi`.
+
+The NTT result remains in Montgomery form. INTT applies `degree_inv` in
+Montgomery form and then converts the final output back to normal domain.
 
 ## Profiling
 
@@ -165,9 +202,11 @@ The benchmark time currently includes restoring the device input before each tra
 
 | Version | Config | Limbs | NTT Time (ms) | NTT GOp/s | INTT Time (ms) | INTT GOp/s | Notes |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| v00 | default | 16 | 0.078 | 323.995 | 0.089 | 283.712 | One kernel launch per radix-2 stage |
-| v01 | default | 16 | 0.0673 | 378.092 | 0.073 | 346.141 | Two-phase radix-staged kernel with stage merging |
-| v02 |  |  |  |  |  |  |  |
+| v00 | default | 16 | 0.078 | 323.995 | 0.089 | 283.712 | Per-stage kernel |
+| v01 | default | 16 | 0.067 | 378.092 | 0.073 | 346.141 | Two-phase radix-staged |
+| v02 | default | 16 | 0.066 | 384.00 | 0.073 | 344.926 | Vectorized phase-boundary IO |
+| v03 | default | 16 | 0.044 | 571.535 | 0.051 | 497.427 | Template-specialized phase config |
+| v04 | default | 16 | 0.017 | 1461.769 | 0.020 | 12420.429 | Montgomery arithmetic with fused input conversion |
 
 ## Version Notes
 
@@ -175,7 +214,10 @@ Use this pattern when adding later versions:
 
 - `v00_base_ntt.cu`: naive per-stage GPU baseline
 - `v01_radix_stages.cu`: phase-split radix-staged kernel
-- `v02_*.cu`: next optimization
+- `v02_vectorized_io.cu`: v01 plus vectorized NTT Phase2 store and INTT Phase1
+  load
+- `v03_template_config.cu`: v02 plus template-specialized phase config
+- `v04_montgomery.cu`: v03 plus Montgomery multiplication and fused input conversion
 
 For each new version, record:
 
