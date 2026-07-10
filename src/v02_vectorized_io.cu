@@ -36,6 +36,88 @@ struct ModulusRuntime {
 #define BLOCK_DIM 256
 #define MAX_PHASE_MERGE 32
 
+__device__ inline void vectorized_load_u32_16(uint32_t* dst,
+                                              const uint32_t* src) {
+    const uint4* src4 = reinterpret_cast<const uint4*>(src);
+    uint4 v0 = src4[0];
+    uint4 v1 = src4[1];
+    uint4 v2 = src4[2];
+    uint4 v3 = src4[3];
+    dst[0] = v0.x;   dst[1] = v0.y;   dst[2] = v0.z;   dst[3] = v0.w;
+    dst[4] = v1.x;   dst[5] = v1.y;   dst[6] = v1.z;   dst[7] = v1.w;
+    dst[8] = v2.x;   dst[9] = v2.y;   dst[10] = v2.z;  dst[11] = v2.w;
+    dst[12] = v3.x;  dst[13] = v3.y;  dst[14] = v3.z;  dst[15] = v3.w;
+}
+
+__device__ inline void vectorized_load_u32_8(uint32_t* dst,
+                                             const uint32_t* src) {
+    const uint4* src4 = reinterpret_cast<const uint4*>(src);
+    uint4 v0 = src4[0];
+    uint4 v1 = src4[1];
+    dst[0] = v0.x;  dst[1] = v0.y;  dst[2] = v0.z;  dst[3] = v0.w;
+    dst[4] = v1.x;  dst[5] = v1.y;  dst[6] = v1.z;  dst[7] = v1.w;
+}
+
+__device__ inline void vectorized_load_u32_4(uint32_t* dst,
+                                             const uint32_t* src) {
+    uint4 v0 = reinterpret_cast<const uint4*>(src)[0];
+    dst[0] = v0.x;  dst[1] = v0.y;  dst[2] = v0.z;  dst[3] = v0.w;
+}
+
+__device__ inline void vectorized_store_u32_16(uint32_t* dst,
+                                               const uint32_t* src) {
+    uint4* dst4 = reinterpret_cast<uint4*>(dst);
+    dst4[0] = make_uint4(src[0], src[1], src[2], src[3]);
+    dst4[1] = make_uint4(src[4], src[5], src[6], src[7]);
+    dst4[2] = make_uint4(src[8], src[9], src[10], src[11]);
+    dst4[3] = make_uint4(src[12], src[13], src[14], src[15]);
+}
+
+__device__ inline void vectorized_store_u32_8(uint32_t* dst,
+                                              const uint32_t* src) {
+    uint4* dst4 = reinterpret_cast<uint4*>(dst);
+    dst4[0] = make_uint4(src[0], src[1], src[2], src[3]);
+    dst4[1] = make_uint4(src[4], src[5], src[6], src[7]);
+}
+
+__device__ inline void vectorized_store_u32_4(uint32_t* dst,
+                                              const uint32_t* src) {
+    reinterpret_cast<uint4*>(dst)[0] =
+        make_uint4(src[0], src[1], src[2], src[3]);
+}
+
+__device__ inline void vectorized_load_u32(uint32_t* dst,
+                                           const uint32_t* src,
+                                           size_t elems) {
+    if (elems == 16) {
+        vectorized_load_u32_16(dst, src);
+    } else if (elems == 8) {
+        vectorized_load_u32_8(dst, src);
+    } else if (elems == 4) {
+        vectorized_load_u32_4(dst, src);
+    } else {
+        for (size_t i = 0; i < elems; ++i) {
+            dst[i] = src[i];
+        }
+    }
+}
+
+__device__ inline void vectorized_store_u32(uint32_t* dst,
+                                            const uint32_t* src,
+                                            size_t elems) {
+    if (elems == 16) {
+        vectorized_store_u32_16(dst, src);
+    } else if (elems == 8) {
+        vectorized_store_u32_8(dst, src);
+    } else if (elems == 4) {
+        vectorized_store_u32_4(dst, src);
+    } else {
+        for (size_t i = 0; i < elems; ++i) {
+            dst[i] = src[i];
+        }
+    }
+}
+
 __host__ __device__ inline uint32_t add_mod(uint32_t a, uint32_t b, uint32_t q) {
     uint64_t sum = static_cast<uint64_t>(a) + b;
     if (sum >= q) sum -= q;
@@ -303,18 +385,9 @@ __global__ void NTTPhase2(uint32_t* A, const uint32_t* twiddles,
                                tw_base);
     }
 
-    size_t final_sm_base = sm_segment_offset + (group_element << stage_merging);
-    for (size_t i = 0; i < merge; i++) {
-        A_radix[final_sm_base + i] = local[i];
-    }
-    __syncthreads();
-
-    size_t block_segment_offset =
-        (static_cast<size_t>(bid) * groups_in_block) << radix_stages;
-    size_t total_block_values = static_cast<size_t>(blockDim.x) << stage_merging;
-    for (size_t offset = tid_s; offset < total_block_values; offset += blockDim.x) {
-        A_limb[block_segment_offset + offset] = A_radix[offset];
-    }
+    uint32_t* dst_ptr =
+        A_limb + segment_offset + (group_element << stage_merging);
+    vectorized_store_u32(dst_ptr, local, merge);
 }
 
 __global__ void INTTPhase1(uint32_t* A, const uint32_t* inv_twiddles,
@@ -350,21 +423,9 @@ __global__ void INTTPhase1(uint32_t* A, const uint32_t* inv_twiddles,
     size_t tail_stages = (radix_stages - 1) % stage_merging + 1;
     size_t merge_stages = (radix_stages - 1) / stage_merging;
 
-    // Load the final-layout segment linearly, then gather through SMEM.
-    size_t block_segment_offset =
-        (static_cast<size_t>(bid) * groups_in_block) << radix_stages;
-    size_t total_block_values = static_cast<size_t>(blockDim.x) << stage_merging;
-    for (size_t offset = tid_s; offset < total_block_values; offset += blockDim.x) {
-        A_radix[offset] = A_limb[block_segment_offset + offset];
-    }
-    __syncthreads();
-
-    size_t input_base =
-        (group_id << radix_stages) + (group_element << stage_merging);
-    for (size_t i = 0; i < merge; i++) {
-        local[i] = A_radix[input_base + i];
-    }
-    __syncthreads();
+    const uint32_t* src_ptr =
+        A_limb + segment_offset + (group_element << stage_merging);
+    vectorized_load_u32(local, src_ptr, merge);
 
     size_t sm_segment_offset = group_id << radix_stages;
     if (merge_stages > 0) {
